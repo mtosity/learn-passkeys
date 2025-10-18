@@ -60,7 +60,7 @@ func (h *Handler) BeginRegistration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// store session data in database
-	_, err = db.Exec("INSERT INTO challenges (user_id, challenge, type, expires_at) VALUES ($1, $2, $3, $4)", user.ID, sessionData.Challenge, "registration", time.Now().Add(5*time.Minute))
+	_, err = db.Exec("INSERT INTO challenges (user_id, challenge, type, expires_at) VALUES ($1, $2, $3, $4)", user.ID, sessionData.Challenge, "registration", sessionData.Expires)
 	if err != nil {
 		http.Error(w, "Failed to store session data", http.StatusInternalServerError)
 		return

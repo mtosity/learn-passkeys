@@ -14,7 +14,7 @@ The goal is educational - to understand how passwordless authentication works in
 ## Project Status
 This is an active learning project. The developer is documenting their journey in `blog.md` and following the roadmap in `next-steps.md`.
 
-### Current Progress (Last Updated: 2025-10-14)
+### Current Progress (Last Updated: 2025-10-18)
 
 **✅ Completed:**
 - Database schema with users, credentials, and challenges tables (init.sql, init-2.sql)
@@ -22,27 +22,39 @@ This is an active learning project. The developer is documenting their journey i
 - Backend Go project structure (backend/)
   - Database connection module (db/db.go)
   - User model implementing webauthn.User interface (models/user.go)
+    - Added `Credentials []webauthn.Credential` field for login flow
   - Credential model (models/credential.go)
   - Handler struct for dependency injection (handlers/handler.go)
   - Registration handlers (handlers/register.go):
     - `POST /register/begin` - Creates user, generates challenge, stores in DB, returns options
     - `POST /register/finish` - Verifies credential, saves to DB, deletes challenge
-  - Main HTTP server with routes (main.go)
-  - Server running on http://localhost:8080
+  - **Login handlers (handlers/login.go):**
+    - `POST /login/begin` - Loads user, loads credentials, generates challenge, returns assertion options
+    - `POST /login/finish` - Verifies signature, updates sign_count, deletes challenge, returns success
+  - Main HTTP server with all 4 routes (main.go)
+  - Server compiles and runs on http://localhost:8080
 
 **🚧 In Progress / Next Steps:**
-- Login handlers (handlers/login.go) - NOT YET BUILT
-  - `BeginLogin` - Look up user, get credentials, generate challenge
-  - `FinishLogin` - Verify signature, update counter, create session
-- Session management (need to add session storage and cookies)
+- Session management (CRITICAL - currently no persistent login state!)
+  - Need to add session storage (cookies or JWT)
+  - Create authentication middleware
+  - Add logout endpoint
+  - Protect routes requiring authentication
 - Frontend React app (not started yet)
 - End-to-end testing with real authenticator
+- CORS configuration for frontend
 
 **📚 Important Learnings:**
 - User creation timing: Currently creating users in BeginRegistration (before passkey created). See `docs/registration-flow-design.md` for discussion of trade-offs vs. creating after successful registration.
-- Challenge storage: Storing challenges in database with 5-minute expiration
-- go-webauthn API: Using v0.14 which uses `CreateCredential()` instead of older `FinishRegistration()`
-- Database patterns: Using QueryRow() for SELECT/INSERT...RETURNING, Exec() for INSERT/UPDATE/DELETE without RETURNING
+- Challenge storage: Storing challenges in database with 5-minute expiration, single-use (deleted after verification)
+- go-webauthn API: Using v0.14 which uses `CreateCredential()` and `ValidateLogin()` methods
+- Database patterns:
+  - Using QueryRow() for SELECT/INSERT...RETURNING (single row, auto-closes)
+  - Using Query() for multiple rows (MUST call defer rows.Close() to prevent connection leaks!)
+  - Using Exec() for INSERT/UPDATE/DELETE without RETURNING
+- Sign counter: Critical security feature to detect cloned authenticators. Library checks counter internally, we just save the updated value.
+- Credential loading: Must load credentials from database and attach to user.Credentials before calling BeginLogin() because webauthn.User interface requires it
+- User struct design: Using single model with Credentials field (not in database) - common pattern for small projects, larger projects often separate database models from domain models
 
 **🔑 Key Implementation Details:**
 - Database name: `passkeys_db` (not `passkeys`)
@@ -51,6 +63,8 @@ This is an active learning project. The developer is documenting their journey i
 - PostgreSQL placeholders: Use `$1`, `$2` (not `?` like MySQL)
 - Challenge comparison: Challenge from client is base64url encoded, stored as BYTEA in DB
 - Credential ID: Raw bytes ([]byte), not UUID format
+- Sign counter update: Critical for security - happens in FinishLogin after ValidateLogin()
+- Connection pooling: Always use `defer rows.Close()` after Query() to return connections to pool
 
 ## Role as AI Assistant
 Your role is to be a **mentor and guide**, not a code generator. When asked for help:

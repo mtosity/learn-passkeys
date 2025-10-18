@@ -1,5 +1,266 @@
 # Development Session Notes
 
+## Session 2025-10-18: Backend Login Flow
+
+### What We Built Today
+
+#### 1. Login Handlers Implementation
+Created complete login flow in `backend/handlers/login.go`:
+
+**BeginLogin (`POST /login/begin`):**
+1. Parse username from request body
+2. Query user from database (return 404 if not found - don't create new users!)
+3. Load user's existing credentials from credentials table
+4. Attach credentials to `user.Credentials` field (required by webauthn.User interface)
+5. Verify user has at least one credential
+6. Call `webAuthn.BeginLogin(user)` to generate challenge and assertion options
+7. Store challenge in challenges table with type "login" and expiration
+8. Return assertion options as JSON (includes `allowCredentials` list)
+
+**FinishLogin (`POST /login/finish`):**
+1. Parse authentication assertion using `protocol.ParseCredentialRequestResponseBody()`
+2. Extract challenge from the assertion
+3. Look up user_id from challenges table using challenge
+4. Load user from database
+5. Load user's credentials from database (same pattern as BeginLogin)
+6. Reconstruct `SessionData` with challenge and user ID
+7. Call `webAuthn.ValidateLogin()` to verify signature (library checks counter internally!)
+8. **Update credential sign_count** in database (critical for clone detection)
+9. Delete used challenge from database
+10. Return success response
+
+#### 2. Routes Added to main.go
+Added login endpoints:
+```go
+http.HandleFunc("/login/begin", handler.BeginLogin)
+http.HandleFunc("/login/finish", handler.FinishLogin)
+```
+
+Server now has 4 endpoints:
+- `POST /register/begin` - Start registration
+- `POST /register/finish` - Complete registration
+- `POST /login/begin` - Start login
+- `POST /login/finish` - Complete login
+
+#### 3. User Model Enhancement
+Modified `models/user.go`:
+- Added `Credentials []webauthn.Credential` field to User struct
+- Updated `WebAuthnCredentials()` to return `u.Credentials` instead of empty slice
+- Credentials are loaded from database and attached to user during login flow
+
+### Key Concepts Learned
+
+#### Login vs Registration - Critical Differences
+**Registration:**
+- User doesn't exist → Create new user
+- No credentials exist → Create new credential
+- Goal: Set up new account
+
+**Login:**
+- User must exist → Return error if not found
+- Credentials must exist → Load from database
+- Goal: Verify user owns the private key
+
+#### Sign Counter Security
+**Purpose:** Detect cloned authenticators (security breach indicator)
+
+**How it works:**
+- Each authenticator has a counter that increments with each signature
+- Counter starts at 0, increases by 1 each login
+- Server stores counter value in database
+- If counter goes backwards or stays same → Possible cloned credential!
+
+**Flow:**
+1. Load old counter from database (e.g., 10)
+2. `ValidateLogin()` checks: newCount > storedCount?
+3. Library sets `CloneWarning = true` if suspicious
+4. Update database with new counter value for next login
+
+**Important:** The library handles counter comparison internally - we just save the updated value!
+
+#### Database Patterns
+**`db.Query()` vs `db.QueryRow()`:**
+- `Query()`: Multiple rows, returns `*sql.Rows`, must call `defer rows.Close()`
+- `QueryRow()`: Single row, auto-closes, no need for `Close()`
+
+**Why `defer rows.Close()`?**
+- Returns database connection to the pool
+- Prevents connection leaks
+- Works even if function returns early (errors, etc.)
+- Without it: Eventually run out of connections, server fails
+
+**Loading credentials pattern:**
+```go
+rows, err := db.Query("SELECT ... FROM credentials WHERE user_id = $1")
+defer rows.Close()  // Critical!
+
+for rows.Next() {
+    rows.Scan(...)
+}
+rows.Err()  // Check for iteration errors
+```
+
+#### User Struct Design: Database vs Domain Models
+**Question:** Why add `Credentials` field to User if it's not in the database?
+
+**Answer:** The `webauthn.User` interface requires `WebAuthnCredentials()` method that returns credentials. We need to populate this before calling `BeginLogin()`.
+
+**Common approaches:**
+1. **Single model with optional fields** (what we're using) - Simple, good for small projects
+2. **Separate UserRow and User models** - Clearer separation, better for large projects
+3. **Embedded structs** - Hybrid approach
+
+Our approach is fine for learning, but production apps often separate database models from domain models.
+
+#### Library Responsibilities vs Our Code
+**go-webauthn library handles:**
+- Signature verification (cryptography)
+- Counter comparison (security check)
+- Setting CloneWarning flag
+- Challenge validation
+- Origin verification (anti-phishing)
+
+**Our code handles:**
+- Loading credentials from database
+- Saving updated counter to database
+- Challenge storage and retrieval
+- User authentication state (sessions - not yet implemented)
+
+### Design Decisions & Trade-offs
+
+#### Credential Loading Strategy
+**Current approach:** Query credentials and attach to user struct before calling library
+
+**Why not query inside `WebAuthnCredentials()` method?**
+- Method doesn't have access to database connection
+- Would need global DB variable (bad practice)
+- Interface doesn't allow passing parameters
+
+**Solution:** Load credentials in handler, store temporarily in `user.Credentials`, library reads from there.
+
+#### Session Management (Not Yet Implemented)
+Currently `FinishLogin` just returns `{"status": "ok"}` - no persistent session!
+
+**Next steps needed:**
+- Add session storage (cookies or JWT)
+- Create authentication middleware
+- Add logout endpoint
+- Protect routes requiring authentication
+
+### Questions Answered
+
+1. **Where is the counter checking happening?**
+   - Inside `h.WebAuthn.ValidateLogin()` on line 163 of login.go
+   - Library compares old counter (from credentials we loaded) with new counter (from authenticator)
+   - Sets `CloneWarning = true` if suspicious, but doesn't fail by default
+   - Returns updated credential with new counter value
+   - We save the new counter to database for next login
+
+2. **Why do we need both credentials table AND user.Credentials field?**
+   - **Database table:** Permanent storage, survives server restarts
+   - **Struct field:** Temporary in-memory holder for one HTTP request
+   - Database is source of truth, struct is just a transport mechanism
+
+3. **Is it common to have struct fields not stored in database?**
+   - Yes! Common patterns:
+     - Computed fields (e.g., FullName from FirstName + LastName)
+     - Lazy-loaded relationships (e.g., credentials loaded on demand)
+     - Interface requirements (e.g., webauthn.User needs credentials)
+   - Small projects: Single model with optional fields (our approach)
+   - Large projects: Separate database models from domain models
+
+4. **Why call `rows.Close()`?**
+   - Database connections are pooled (limited number available)
+   - `Query()` borrows a connection from the pool
+   - `Close()` returns connection to pool for reuse
+   - Without it: Connection leak, eventually run out, server hangs
+   - `defer` ensures it runs even if we return early (errors)
+
+### Testing Done
+- ✅ Code compiles with `go build`
+- ✅ All 4 routes registered correctly
+- ⚠️ Not tested end-to-end yet (requires frontend + real authenticator)
+
+### What's Working Now
+Backend API is **functionally complete** for basic passkey authentication:
+- User registration with passkey creation
+- User login with passkey verification
+- Challenge-based security
+- Clone detection via sign counter
+- All endpoints implemented and routes registered
+
+**Missing pieces:**
+- Session management (no persistent login state)
+- Frontend UI to interact with authenticator
+- CORS headers for frontend-backend communication
+- Protected routes demonstrating authentication
+
+### Next Session Tasks
+
+#### Priority 1: Session Management (Recommended Next)
+Add persistent authentication state:
+- Implement session storage (cookies or JWT tokens)
+- Create authentication middleware to protect routes
+- Add logout endpoint (`POST /logout`)
+- Add protected route example (e.g., `GET /secret` - only for logged-in users)
+- Consider using `gorilla/sessions` library for cookie-based sessions
+
+**Why this matters:**
+- Currently login succeeds but nothing happens
+- No way to check if user is authenticated
+- Can't protect routes requiring authentication
+
+#### Priority 2: Frontend React App
+Build UI to test the full flow:
+- Initialize React + Vite project in `frontend/` directory
+- Install `@simplewebauthn/browser` for WebAuthn client helpers
+- Create registration page with form
+- Create login page with form
+- Create protected "secret" page (shows message only when logged in)
+- Handle browser WebAuthn API calls (`navigator.credentials.create/get`)
+- Display success/error states
+- Add CORS configuration to backend
+
+#### Priority 3: Polish & Production Readiness
+- Add CORS headers in main.go (allow frontend origin)
+- Improve error messages (more specific feedback)
+- Add request logging
+- Handle `CloneWarning` flag (log suspicious logins)
+- Add rate limiting for registration/login endpoints
+- Consider adding username validation
+- Clean up expired challenges periodically
+
+### Files Modified Today
+- `backend/handlers/login.go` - Created with BeginLogin and FinishLogin
+- `backend/models/user.go` - Added Credentials field to User struct
+- `backend/main.go` - Added login routes
+
+### Useful Commands
+```bash
+# Build backend
+cd backend && go build -o server
+
+# Run backend server
+./server
+
+# Test login begin (should fail - no user)
+curl -X POST http://localhost:8080/login/begin \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice"}'
+
+# Test registration begin
+curl -X POST http://localhost:8080/register/begin \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice"}'
+```
+
+### Resources Referenced
+- go-webauthn ValidateLogin: Used for signature verification and counter checking
+- Go database/sql Rows: Understanding Query() vs QueryRow() and connection pooling
+- defer statement: Ensuring resource cleanup with rows.Close()
+
+---
+
 ## Session 2025-10-14: Backend Registration Flow
 
 ### What We Built Today

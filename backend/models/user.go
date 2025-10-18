@@ -8,9 +8,10 @@ import (
 )
 
 type User struct {
-	ID        uuid.UUID
-	Username  string
-	CreatedAt time.Time
+	ID          uuid.UUID
+	Username    string
+	CreatedAt   time.Time
+	Credentials []webauthn.Credential //additional fields for application logic
 }
 
 func (u User) WebAuthnID() []byte {
@@ -27,8 +28,7 @@ func (u User) WebAuthnDisplayName() string {
 }
 
 func (u User) WebAuthnCredentials() []webauthn.Credential {
-	// For now, return empty - we'll load credentials from DB later
-	return []webauthn.Credential{}
+	return u.Credentials
 }
 
 func (u User) WebAuthnIcon() string {
