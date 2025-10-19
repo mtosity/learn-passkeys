@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -53,14 +54,28 @@ func (h *Handler) BeginRegistration(w http.ResponseWriter, r *http.Request) {
 	// generate registration options
 	options, sessionData, err := h.WebAuthn.BeginRegistration(
 		&user,
+		webauthn.WithConveyancePreference(protocol.PreferNoAttestation),
+		webauthn.WithAttestationFormats([]protocol.AttestationFormat{
+			protocol.AttestationFormatNone,
+		}),
 	)
 	if err != nil {
 		http.Error(w, "Failed to begin registration", http.StatusInternalServerError)
 		return
 	}
 
+	// DEBUG: Print full SessionData
+	fmt.Printf("DEBUG BeginRegistration SessionData: %+v\n", sessionData)
+
+	// Serialize entire SessionData to JSON
+	sessionDataJSON, err := json.Marshal(sessionData)
+	if err != nil {
+		http.Error(w, "Failed to marshal session data", http.StatusInternalServerError)
+		return
+	}
+
 	// store session data in database
-	_, err = db.Exec("INSERT INTO challenges (user_id, challenge, type, expires_at) VALUES ($1, $2, $3, $4)", user.ID, sessionData.Challenge, "registration", sessionData.Expires)
+	_, err = db.Exec("INSERT INTO challenges (user_id, challenge, type, expires_at) VALUES ($1, $2, $3, $4)", user.ID, sessionDataJSON, "registration", sessionData.Expires)
 	if err != nil {
 		http.Error(w, "Failed to store session data", http.StatusInternalServerError)
 		return
@@ -88,10 +103,29 @@ func (h *Handler) FinishRegistration(w http.ResponseWriter, r *http.Request) {
 
 	challenge := parsedResponse.Response.CollectedClientData.Challenge
 
+	// Get the most recent registration challenge (for development simplicity)
 	var userID uuid.UUID
-	err = h.DB.QueryRow("SELECT user_id FROM challenges WHERE challenge = $1 AND type = $2", challenge, "registration").Scan(&userID)
+	var sessionDataJSON []byte
+	err = h.DB.QueryRow("SELECT user_id, challenge FROM challenges WHERE type = $1 ORDER BY created_at DESC LIMIT 1", "registration").Scan(&userID, &sessionDataJSON)
 	if err != nil {
+		fmt.Printf("Challenge lookup error: %v\n", err)
 		http.Error(w, "Challenge not found", http.StatusBadRequest)
+		return
+	}
+
+	// 4. Deserialize SessionData from database
+	var sessionData webauthn.SessionData
+	err = json.Unmarshal(sessionDataJSON, &sessionData)
+	if err != nil {
+		fmt.Printf("Unmarshal error: %v\n", err)
+		http.Error(w, "Failed to unmarshal session data", http.StatusInternalServerError)
+		return
+	}
+
+	// Verify the challenge matches
+	if string(sessionData.Challenge) != string(challenge) {
+		fmt.Printf("Challenge mismatch: stored=%s, received=%s\n", sessionData.Challenge, challenge)
+		http.Error(w, "Challenge mismatch", http.StatusBadRequest)
 		return
 	}
 
@@ -102,30 +136,57 @@ func (h *Handler) FinishRegistration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Call webAuthn.FinishRegistration(user, session, response)
-	sessionData := webauthn.SessionData{
-		Challenge: challenge,
-		UserID:    user.ID[:],
-	}
+	fmt.Printf("DEBUG FinishRegistration SessionData: %+v\n", sessionData)
+	fmt.Printf("DEBUG: User ID: %s\n", user.ID)
+	fmt.Printf("DEBUG: Challenge length: %d\n", len(challenge))
+	fmt.Printf("DEBUG: Parsed response type: %T\n", parsedResponse)
+	fmt.Printf("DEBUG: Attestation format from response: %s\n", parsedResponse.Response.AttestationObject.Format)
+	fmt.Printf("DEBUG: Attestation statement: %+v\n", parsedResponse.Response.AttestationObject.AttStatement)
+
 	credential, err := h.WebAuthn.CreateCredential(&user, sessionData, parsedResponse)
 	if err != nil {
+		fmt.Printf("CreateCredential error: %v\n", err)
+		fmt.Printf("Error type: %T\n", err)
+		// Try to print more details about the error
+		fmt.Printf("Full error string: %+v\n", err)
 		http.Error(w, "Failed to finish registration: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// 5. Save credential to database
-	_, err = h.DB.Exec("INSERT INTO credentials (id, user_id, public_key, sign_count, created_at) VALUES ($1, $2, $3, $4, $5)", credential.ID, user.ID, credential.PublicKey, credential.Authenticator.SignCount, time.Now())
+	fmt.Printf("DEBUG: Credential created successfully, ID length: %d\n", len(credential.ID))
+	fmt.Printf("DEBUG: Credential details: %+v\n", credential)
+	fmt.Printf("DEBUG: Authenticator: %+v\n", credential.Authenticator)
+
+	// 5. Save credential to database with backup flags
+	_, err = h.DB.Exec(`INSERT INTO credentials
+		(id, user_id, public_key, sign_count, backup_eligible, backup_state, attestation_type, aaguid, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		credential.ID,
+		user.ID,
+		credential.PublicKey,
+		credential.Authenticator.SignCount,
+		credential.Flags.BackupEligible,
+		credential.Flags.BackupState,
+		credential.AttestationType,
+		credential.Authenticator.AAGUID,
+		time.Now(),
+	)
 	if err != nil {
 		http.Error(w, "Failed to save credential", http.StatusInternalServerError)
 		return
 	}
 
 	// 6. Delete used challenge
-	_, err = h.DB.Exec("DELETE FROM challenges WHERE challenge = $1 AND type = $2", challenge, "registration")
+	_, err = h.DB.Exec("DELETE FROM challenges WHERE user_id = $1 AND type = $2", user.ID, "registration")
 	if err != nil {
 		http.Error(w, "Failed to delete challenge", http.StatusInternalServerError)
 		return
 	}
 	// 7. Return success
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "Registration successful",
+	})
 }

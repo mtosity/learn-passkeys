@@ -29,8 +29,9 @@ func (h *Handler) BeginLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// load user's credentials from db
-	rows, err := db.Query("SELECT id, public_key, sign_count FROM credentials WHERE user_id = $1", user.ID)
+	// load user's credentials from db with backup flags
+	rows, err := db.Query(`SELECT id, public_key, sign_count, backup_eligible, backup_state, aaguid
+		FROM credentials WHERE user_id = $1`, user.ID)
 	if err != nil {
 		http.Error(w, "Failed to load user credentials", http.StatusInternalServerError)
 		return
@@ -42,19 +43,26 @@ func (h *Handler) BeginLogin(w http.ResponseWriter, r *http.Request) {
 		var creID []byte
 		var publicKey []byte
 		var signCount uint32
+		var backupEligible bool
+		var backupState bool
+		var aaguid []byte
 
-		if err := rows.Scan(&creID, &publicKey, &signCount); err != nil {
+		if err := rows.Scan(&creID, &publicKey, &signCount, &backupEligible, &backupState, &aaguid); err != nil {
 			http.Error(w, "Failed to scan credential", http.StatusInternalServerError)
 			return
 		}
 
-		credentials = append(credentials, webauthn.Credential{
+		cred := webauthn.Credential{
 			ID:        creID,
 			PublicKey: publicKey,
 			Authenticator: webauthn.Authenticator{
+				AAGUID:    aaguid,
 				SignCount: signCount,
 			},
-		})
+		}
+		cred.Flags.BackupEligible = backupEligible
+		cred.Flags.BackupState = backupState
+		credentials = append(credentials, cred)
 	}
 	if err := rows.Err(); err != nil {
 		http.Error(w, "Error iterating credentials", http.StatusInternalServerError)
@@ -119,8 +127,9 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load credentials - Get user's passkeys for verification
-	rows, err := h.DB.Query("SELECT id, public_key, sign_count FROM credentials WHERE user_id = $1", user.ID)
+	// Load credentials - Get user's passkeys for verification with backup flags
+	rows, err := h.DB.Query(`SELECT id, public_key, sign_count, backup_eligible, backup_state, aaguid
+		FROM credentials WHERE user_id = $1`, user.ID)
 	if err != nil {
 		http.Error(w, "Failed to load user credentials", http.StatusInternalServerError)
 		return
@@ -132,19 +141,26 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 		var creID []byte
 		var publicKey []byte
 		var signCount uint32
+		var backupEligible bool
+		var backupState bool
+		var aaguid []byte
 
-		if err := rows.Scan(&creID, &publicKey, &signCount); err != nil {
+		if err := rows.Scan(&creID, &publicKey, &signCount, &backupEligible, &backupState, &aaguid); err != nil {
 			http.Error(w, "Failed to scan credential", http.StatusInternalServerError)
 			return
 		}
 
-		credentials = append(credentials, webauthn.Credential{
+		cred := webauthn.Credential{
 			ID:        creID,
 			PublicKey: publicKey,
 			Authenticator: webauthn.Authenticator{
+				AAGUID:    aaguid,
 				SignCount: signCount,
 			},
-		})
+		}
+		cred.Flags.BackupEligible = backupEligible
+		cred.Flags.BackupState = backupState
+		credentials = append(credentials, cred)
 	}
 	if err := rows.Err(); err != nil {
 		http.Error(w, "Error iterating credentials", http.StatusInternalServerError)

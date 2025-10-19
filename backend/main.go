@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"learn-passkeys.com/m/db"
 	"learn-passkeys.com/m/handlers"
@@ -67,9 +68,10 @@ func main() {
 	}
 
 	wconfig := &webauthn.Config{
-		RPDisplayName: "Learn Passkeys",
-		RPID:          rpID,
-		RPOrigins:     origins,
+		RPDisplayName:         "Learn Passkeys",
+		RPID:                  rpID,
+		RPOrigins:             origins,
+		AttestationPreference: protocol.PreferNoAttestation,
 	}
 
 	webAuthn, err := webauthn.New(wconfig)

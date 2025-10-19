@@ -1,21 +1,27 @@
-import { useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
-import { registerUser } from '@/lib/webauthn';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { useState } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
+import { registerUser } from "@/lib/webauthn";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 
 export function Register() {
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState("");
   const navigate = useNavigate();
 
   const registerMutation = useMutation({
     mutationFn: registerUser,
     onSuccess: () => {
-      alert('Registration successful! You can now log in.');
-      navigate('/login');
+      alert("Registration successful! You can now log in.");
+      navigate("/login");
     },
     onError: (error: Error) => {
       alert(`Registration failed: ${error.message}`);
@@ -25,7 +31,7 @@ export function Register() {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!username.trim()) {
-      alert('Please enter a username');
+      alert("Please enter a username");
       return;
     }
     registerMutation.mutate(username);
@@ -58,7 +64,9 @@ export function Register() {
               className="w-full"
               disabled={registerMutation.isPending}
             >
-              {registerMutation.isPending ? 'Registering...' : 'Register with Passkey'}
+              {registerMutation.isPending
+                ? "Registering..."
+                : "Register with Passkey"}
             </Button>
           </form>
           <div className="mt-4 text-center text-sm">
@@ -66,7 +74,7 @@ export function Register() {
             <Button
               variant="link"
               className="p-0"
-              onClick={() => navigate('/login')}
+              onClick={() => navigate("/login")}
             >
               Login
             </Button>
