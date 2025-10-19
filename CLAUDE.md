@@ -14,47 +14,58 @@ The goal is educational - to understand how passwordless authentication works in
 ## Project Status
 This is an active learning project. The developer is documenting their journey in `blog.md` and following the roadmap in `next-steps.md`.
 
-### Current Progress (Last Updated: 2025-10-18)
+### Current Progress (Last Updated: 2025-10-19)
 
-**✅ Completed:**
-- Database schema with users, credentials, and challenges tables (init.sql, init-2.sql)
-- PostgreSQL running in Docker (docker-compose.yml)
-- Backend Go project structure (backend/)
+**✅ Completed - FULLY WORKING FULLSTACK APPLICATION:**
+- **Database schema** with users, credentials, and challenges tables (init.sql, init-2.sql, init-3.sql)
+  - Added backup flags (backup_eligible, backup_state)
+  - Added authenticator metadata (aaguid, attestation_type)
+  - PostgreSQL running in Docker (docker-compose.yml)
+- **Backend Go server** (go-webauthn v0.14.0):
   - Database connection module (db/db.go)
   - User model implementing webauthn.User interface (models/user.go)
-    - Added `Credentials []webauthn.Credential` field for login flow
   - Credential model (models/credential.go)
   - Handler struct for dependency injection (handlers/handler.go)
-  - Registration handlers (handlers/register.go):
-    - `POST /register/begin` - Creates user, generates challenge, stores in DB, returns options
-    - `POST /register/finish` - Verifies credential, saves to DB, deletes challenge
+  - **Registration handlers (handlers/register.go):**
+    - `POST /register/begin` - Creates user, generates challenge with attestation config, stores COMPLETE SessionData
+    - `POST /register/finish` - Verifies credential, saves with ALL flags (backup_eligible, backup_state, aaguid), deletes challenge
   - **Login handlers (handlers/login.go):**
-    - `POST /login/begin` - Loads user, loads credentials, generates challenge, returns assertion options
-    - `POST /login/finish` - Verifies signature, updates sign_count, deletes challenge, returns success
-  - Main HTTP server with all 4 routes (main.go)
-  - Server compiles and runs on http://localhost:8080
+    - `POST /login/begin` - Loads user with credentials (including flags), generates challenge
+    - `POST /login/finish` - Verifies signature with complete credential state, updates sign_count, returns success
+  - CORS middleware for frontend communication
+  - Server runs on http://localhost:8080
+- **Frontend React app** (@simplewebauthn/browser v13.2.2):
+  - Registration page with passkey creation flow
+  - Login page with passkey authentication
+  - Protected "Secret" page (shows message only when authenticated)
+  - Simple localStorage-based session (suitable for learning)
+  - UI built with Tailwind CSS + shadcn/ui components
+  - Runs on http://localhost:5173 (Vite dev server)
+- **✅ END-TO-END TESTED:** Registration → Login → Protected Page all working!
 
-**🚧 In Progress / Next Steps:**
-- Session management (CRITICAL - currently no persistent login state!)
-  - Need to add session storage (cookies or JWT)
-  - Create authentication middleware
-  - Add logout endpoint
-  - Protect routes requiring authentication
-- Frontend React app (not started yet)
-- End-to-end testing with real authenticator
-- CORS configuration for frontend
+**🚧 Optional Enhancements (Not Critical for Learning):**
+- Session management improvements (cookies or JWT instead of localStorage)
+- Authentication middleware on backend
+- Logout endpoint
+- Multiple credentials per user management UI
+- Error handling improvements
+- Request logging
+- CloneWarning detection and alerts
 
 **📚 Important Learnings:**
-- User creation timing: Currently creating users in BeginRegistration (before passkey created). See `docs/registration-flow-design.md` for discussion of trade-offs vs. creating after successful registration.
-- Challenge storage: Storing challenges in database with 5-minute expiration, single-use (deleted after verification)
-- go-webauthn API: Using v0.14 which uses `CreateCredential()` and `ValidateLogin()` methods
-- Database patterns:
+- **SessionData must be stored complete:** Don't reconstruct SessionData from individual fields! Store the entire object from BeginRegistration as JSON. The library needs RelyingPartyID, CredParams, and other fields for proper verification. See `docs/integration-debugging-guide.md` for full details.
+- **Credential flags are security-critical:** Must store backup_eligible, backup_state, AAGUID, and attestation_type. The library validates these flags don't change between registration and login to detect credential cloning attacks.
+- **User creation timing:** Currently creating users in BeginRegistration (before passkey created). See `docs/registration-flow-design.md` for discussion of trade-offs vs. creating after successful registration.
+- **Challenge storage:** Storing complete SessionData (as JSON) in challenges table with 5-minute expiration, single-use (deleted after verification)
+- **go-webauthn API:** Using v0.14.0 which uses `CreateCredential()` and `ValidateLogin()` methods
+- **Database patterns:**
   - Using QueryRow() for SELECT/INSERT...RETURNING (single row, auto-closes)
   - Using Query() for multiple rows (MUST call defer rows.Close() to prevent connection leaks!)
   - Using Exec() for INSERT/UPDATE/DELETE without RETURNING
-- Sign counter: Critical security feature to detect cloned authenticators. Library checks counter internally, we just save the updated value.
-- Credential loading: Must load credentials from database and attach to user.Credentials before calling BeginLogin() because webauthn.User interface requires it
-- User struct design: Using single model with Credentials field (not in database) - common pattern for small projects, larger projects often separate database models from domain models
+- **Sign counter:** Critical security feature to detect cloned authenticators. Library checks counter internally, we just save the updated value.
+- **Credential loading:** Must load ALL credential fields from database including flags before calling BeginLogin() or ValidateLogin()
+- **User struct design:** Using single model with Credentials field (not in database) - common pattern for small projects, larger projects often separate database models from domain models
+- **Integration debugging:** Error messages can be misleading - "Invalid attestation format" was actually missing SessionData fields. Printf debugging with `%+v` is invaluable. See `docs/integration-debugging-guide.md` for complete debugging walkthrough.
 
 **🔑 Key Implementation Details:**
 - Database name: `passkeys_db` (not `passkeys`)

@@ -1,5 +1,334 @@
 # Development Session Notes
 
+## Session 2025-10-19: Integration Testing & Debugging
+
+### What We Accomplished Today
+
+Successfully integrated and debugged the complete fullstack passkey authentication system! The entire registration and login flow now works end-to-end.
+
+#### 1. Frontend-Backend Integration Testing
+
+**Initial State:**
+- Backend: All 4 endpoints implemented (registration begin/finish, login begin/finish)
+- Frontend: React app with Register, Login, and Secret pages
+- Database: PostgreSQL with users, credentials, and challenges tables
+- CORS: Configured for localhost:5173
+
+**Testing Started:**
+- Launched both frontend (localhost:5173) and backend (localhost:8080)
+- Attempted registration flow
+- Immediately hit: "Invalid attestation format" error
+
+#### 2. Debugging Session: Invalid Attestation Format
+
+**Problem:** Registration failed with `CreateCredential error: Invalid attestation format`
+
+**Investigation Process:**
+
+**Attempt 1: Configure Attestation Preferences**
+- Added `WithConveyancePreference(protocol.PreferNoAttestation)` to BeginRegistration
+- Added `WithAttestationFormats([]protocol.AttestationFormat{protocol.AttestationFormatNone})` to BeginRegistration
+- Added `AttestationPreference: protocol.PreferNoAttestation` to Config
+- **Result:** Still failed
+
+**Attempt 2: Check Library Version**
+- Downgraded from v0.14.0 to v0.13.4
+- **Result:** Still failed - not a version issue
+
+**Attempt 3: Deep Debugging with Logs**
+Added comprehensive debug logging:
+```go
+fmt.Printf("DEBUG: Attestation format from response: %s\n", parsedResponse.Response.AttestationObject.Format)
+fmt.Printf("DEBUG: SessionData: %+v\n", sessionData)
+```
+
+**Breakthrough Discovery:**
+Compared SessionData from BeginRegistration vs FinishRegistration:
+
+**BeginRegistration:**
+```
+RelyingPartyID: "localhost"
+CredParams: [{Type:public-key Algorithm:-7} ... 10 algorithms]
+```
+
+**FinishRegistration (reconstructed):**
+```
+RelyingPartyID: ""  ← EMPTY!
+CredParams: []      ← EMPTY!
+```
+
+**Root Cause Identified:**
+We were only storing the `challenge` field in the database and reconstructing SessionData manually. The library needs the COMPLETE SessionData including RelyingPartyID and CredParams for proper attestation validation.
+
+**The Fix:**
+Store and retrieve the ENTIRE SessionData object as JSON:
+
+```go
+// BeginRegistration - Store complete SessionData
+sessionDataJSON, err := json.Marshal(sessionData)
+db.Exec("INSERT INTO challenges (...) VALUES (..., $2, ...)", sessionDataJSON)
+
+// FinishRegistration - Retrieve and deserialize
+var sessionDataJSON []byte
+db.QueryRow("SELECT challenge FROM challenges...").Scan(&sessionDataJSON)
+var sessionData webauthn.SessionData
+json.Unmarshal(sessionDataJSON, &sessionData)
+```
+
+**Result:** ✅ Registration succeeded!
+
+#### 3. Debugging Session: Backup Eligible Flag Inconsistency
+
+**Problem:** Registration worked, but login failed with:
+```
+Backup Eligible flag inconsistency detected during login validation
+```
+
+**Investigation:**
+Added debug logging to see credential details:
+```go
+fmt.Printf("DEBUG: Credential details: %+v\n", credential)
+fmt.Printf("DEBUG: Authenticator: %+v\n", credential.Authenticator)
+```
+
+**Discovery:**
+Credentials have security-critical flags we weren't storing:
+```
+Flags: {
+    UserPresent: true
+    UserVerified: true
+    BackupEligible: true
+    BackupState: true
+}
+Authenticator: {
+    AAGUID: [186 218 85 102...]
+    SignCount: 0
+}
+```
+
+**Root Cause:**
+Our database schema only had: id, user_id, public_key, sign_count
+Missing: backup_eligible, backup_state, aaguid, attestation_type
+
+When the library compared flags between registration and login, it detected inconsistency (missing flags = potential security issue).
+
+**The Fix:**
+
+**Step 1: Database Migration (init-3.sql)**
+```sql
+ALTER TABLE credentials
+ADD COLUMN backup_eligible BOOLEAN DEFAULT false,
+ADD COLUMN backup_state BOOLEAN DEFAULT false,
+ADD COLUMN attestation_type VARCHAR(50) DEFAULT '',
+ADD COLUMN aaguid BYTEA;
+```
+
+**Step 2: Save Flags During Registration**
+```go
+db.Exec(`INSERT INTO credentials
+    (id, user_id, public_key, sign_count, backup_eligible, backup_state, aaguid, ...)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, ...)`,
+    credential.ID,
+    user.ID,
+    credential.PublicKey,
+    credential.Authenticator.SignCount,
+    credential.Flags.BackupEligible,
+    credential.Flags.BackupState,
+    credential.Authenticator.AAGUID,
+)
+```
+
+**Step 3: Load Flags During Login**
+```go
+rows := db.Query(`SELECT id, public_key, sign_count, backup_eligible, backup_state, aaguid
+    FROM credentials WHERE user_id = $1`, user.ID)
+
+credentials = append(credentials, webauthn.Credential{
+    ID:        creID,
+    PublicKey: publicKey,
+    Flags: protocol.CredentialFlags{
+        BackupEligible: backupEligible,
+        BackupState:    backupState,
+    },
+    Authenticator: webauthn.Authenticator{
+        AAGUID:    aaguid,
+        SignCount: signCount,
+    },
+})
+```
+
+**Result:** ✅ Login succeeded!
+
+#### 4. Minor Fix: Empty JSON Response
+
+**Problem:** Registration succeeded on backend but frontend showed JSON parse error
+
+**Cause:** Backend returned HTTP 200 but no response body
+
+**Fix:**
+```go
+w.Header().Set("Content-Type", "application/json")
+w.WriteHeader(http.StatusOK)
+json.NewEncoder(w).Encode(map[string]string{
+    "status":  "success",
+    "message": "Registration successful",
+})
+```
+
+### Key Learnings
+
+#### 1. SessionData Must Be Stored Complete
+**Wrong approach:**
+```go
+// Only store challenge, reconstruct rest
+sessionData := webauthn.SessionData{
+    Challenge: challenge,
+    UserID:    user.ID[:],
+}
+```
+
+**Correct approach:**
+```go
+// Store entire SessionData from BeginRegistration
+sessionDataJSON, _ := json.Marshal(sessionData)
+// Later: json.Unmarshal(sessionDataJSON, &sessionData)
+```
+
+**Why:** The library needs RelyingPartyID, CredParams, and other fields for proper verification.
+
+#### 2. Credential Flags Are Security-Critical
+
+**BackupEligible & BackupState flags:**
+- Indicate if credential can be/is backed up (synced to cloud)
+- Library validates these don't change unexpectedly
+- Changing flags = potential credential cloning attack
+
+**AAGUID:**
+- Authenticator Attestation GUID
+- Identifies the make/model of the authenticator
+- Used for security policy decisions
+
+**Must store:** backup_eligible, backup_state, aaguid, attestation_type
+
+#### 3. Error Messages Can Be Misleading
+
+"Invalid attestation format" sounds like a parsing issue, but was actually:
+- Missing SessionData fields for verification
+- The library couldn't validate because data was incomplete
+
+"Backup flag inconsistency" was clear once we knew what to look for.
+
+#### 4. go-webauthn v0.14.0 Works Fine
+
+We downgraded to v0.13.4 thinking it was a version issue, but the problems were in our implementation. Upgraded back to v0.14.0 and everything works.
+
+#### 5. Debug Logging Is Essential
+
+Printf debugging with `%+v` format helped immensely:
+- Compare expected vs actual SessionData
+- See all credential flags and fields
+- Understand what the library needs
+
+### What's Working Now
+
+**✅ Complete Authentication Flow:**
+1. User registers with passkey (Touch ID, Face ID, security key, etc.)
+2. Credential stored with all flags and metadata
+3. User logs in with passkey
+4. Session created (localStorage for now)
+5. Protected routes work (Secret page)
+
+**✅ Security Features:**
+- Challenge-based authentication
+- Sign counter tracking (clone detection)
+- Backup flag validation
+- Origin verification
+- HTTPS/localhost enforcement
+
+**✅ Database Integrity:**
+- Complete credential state stored
+- SessionData properly persisted
+- Challenge cleanup after use
+- Foreign key relationships
+
+### Files Modified Today
+
+**Database:**
+- `init-3.sql` - Added backup flags columns
+
+**Backend:**
+- `handlers/register.go`:
+  - Store complete SessionData as JSON
+  - Save all credential flags (backup_eligible, backup_state, aaguid)
+  - Return proper JSON response
+- `handlers/login.go`:
+  - Load credentials with backup flags
+  - Reconstruct complete Credential objects
+- `main.go`:
+  - Added AttestationPreference configuration
+
+**Documentation:**
+- `docs/integration-debugging-guide.md` - Comprehensive debugging guide (NEW)
+- `docs/session-notes.md` - This session documentation
+
+### Current Stack
+
+**Versions:**
+- `@simplewebauthn/browser`: v13.2.2
+- `go-webauthn/webauthn`: v0.14.0 ✅
+- React: v19.1.1
+- PostgreSQL: Alpine (Docker)
+
+**Architecture:**
+- Frontend: http://localhost:5173 (Vite dev server)
+- Backend: http://localhost:8080 (Go server)
+- Database: localhost:5432 (PostgreSQL in Docker)
+
+### Next Steps
+
+**Completed Core Features:**
+- ✅ Registration flow
+- ✅ Login flow
+- ✅ Protected routes (basic localStorage check)
+
+**Optional Enhancements:**
+- [ ] Proper session management (cookies or JWT)
+- [ ] Logout endpoint
+- [ ] Authentication middleware
+- [ ] Multiple credentials per user
+- [ ] Credential management UI (view/delete passkeys)
+- [ ] Error handling improvements
+- [ ] Request logging
+- [ ] CloneWarning detection alerts
+- [ ] Expired challenge cleanup job
+
+**Learning Goals:**
+- ✅ Understand WebAuthn registration ceremony
+- ✅ Understand WebAuthn authentication ceremony
+- ✅ Debug real integration issues
+- ✅ Learn backup flag importance
+- ✅ Complete fullstack passkey implementation
+- [ ] Write comprehensive blog post
+- [ ] Test on multiple devices/browsers
+
+### Resources That Helped
+
+- **go-webauthn source code:** Reading the actual verification logic helped understand what fields were needed
+- **SimpleWebAuthn docs:** Clear examples of request/response formats
+- **WebAuthn spec:** Understanding backup flags and their purpose
+- **Printf debugging:** The old reliable method still wins
+
+### Time Investment
+
+- **Total session:** ~3 hours
+- **"Invalid attestation format" debugging:** ~1.5 hours
+- **"Backup flag inconsistency" debugging:** ~1 hour
+- **Documentation:** ~30 minutes
+
+**Worth it:** Absolutely! Deep understanding of WebAuthn internals achieved.
+
+---
+
 ## Session 2025-10-18: Backend Login Flow
 
 ### What We Built Today
